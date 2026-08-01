@@ -265,8 +265,8 @@ def create_frame(turn, output_path, frame_num=0):
     draw.text((110, header_y), "VELOCITY", fill=WHITE, font=f_title_white, anchor="lm")
     v_bbox = draw.textbbox((110, header_y), "VELOCITY", font=f_title_white, anchor="lm")
     
-    draw.text((v_bbox[2] + 8, header_y), "GERMAN", fill=YELLOW, font=f_title_white, anchor="lm")
-    s_bbox = draw.textbbox((v_bbox[2] + 8, header_y), "GERMAN", font=f_title_white, anchor="lm")
+    draw.text((v_bbox[2] + 8, header_y), "SWEDISH", fill=YELLOW, font=f_title_white, anchor="lm")
+    s_bbox = draw.textbbox((v_bbox[2] + 8, header_y), "SWEDISH", font=f_title_white, anchor="lm")
 
     draw.text((s_bbox[2] + 8, header_y), "PODCAST", fill=WHITE, font=f_title_white, anchor="lm")
     p_bbox = draw.textbbox((s_bbox[2] + 8, header_y), "PODCAST", font=f_title_white, anchor="lm")
@@ -288,7 +288,7 @@ def create_frame(turn, output_path, frame_num=0):
 
     # === SPEAKER STATUS SECTION ===
     is_host1 = turn.get("speaker") == "Host1"
-    speaker_name = "ASTrid" if is_host1 else "ERIK"
+    speaker_name = "ASTRID" if is_host1 else "ERIK"
     pill_x, pill_y = 120, 210
     pill_w, pill_h = 220, 52
 
@@ -299,7 +299,7 @@ def create_frame(turn, output_path, frame_num=0):
 
     draw.text((pill_x + pill_w + 25, pill_y + 26), "pratar", fill=LIGHT_GRAY, font=f_hablando, anchor="lm")
 
-    # === MAIN GERMAN TEXT ===
+    # === MAIN SWEDISH TEXT ===
 
     # === MAIN TEXT (auto-size, HARD max 3 lines) ===
     swedish_text = turn.get("swedish", turn.get("spanish", ""))
@@ -515,7 +515,7 @@ def _fallback_script(topic_es, topic_en):
     for i in range(150):
         s = "Host2" if i % 2 == 0 else "Host1"
         if s == "Host2":
-            turns.append({"speaker": s, "swedish": f"Hej, jag är Erik. Sprechen wir über die **Zukunft** und über {topic_es}.", "english": f"Hi, I'm Erik. Let's talk about the future and {topic_en}."})
+            turns.append({"speaker": s, "swedish": f"Hej, jag är Erik. Idag pratar vi om {topic_es}.", "english": f"Hi, I'm Erik. Today we talk about {topic_en}."})
         else:
             turns.append({"speaker": s, "swedish": f"Bra idé, Erik. {topic_es} är väldigt **intressant**.", "english": f"Good idea Erik. {topic_en} is very interesting."})
     return turns
@@ -601,7 +601,7 @@ def create_video(turns, audio_files, video_dir=None):
 
 async def main():
     print("=" * 60)
-    print("  VELOCITY GERMAN PODCAST")
+    print("  VELOCITY SWEDISH PODCAST")
     print("=" * 60)
 
     print("\n[1/4] Generating script (150 turns)...")
