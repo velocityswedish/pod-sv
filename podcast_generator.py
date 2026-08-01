@@ -134,11 +134,16 @@ def draw_person_icon(draw, center_x, center_y):
 def draw_swedish_flag(img, draw, center_x, center_y, radius=22):
     flag_img = Image.new('RGBA', (radius*2, radius*2), (0, 0, 0, 0))
     fdraw = ImageDraw.Draw(flag_img)
-    # Swedish flag: Black top (33%), Red middle (33%), Gold bottom (33%)
-    h = radius * 2
-    fdraw.rectangle([(0, 0), (radius*2, int(h * 0.33))], fill=(0, 0, 0, 255))
-    fdraw.rectangle([(0, int(h * 0.33)), (radius*2, int(h * 0.66))], fill=(221, 0, 0, 255))
-    fdraw.rectangle([(0, int(h * 0.66)), (radius*2, h)], fill=(255, 204, 0, 255))
+    # Swedish flag: blue with yellow Scandinavian cross
+    w = radius * 2
+    blue = (0, 106, 167, 255)
+    yellow = (254, 204, 18, 255)
+    fdraw.rectangle([(0, 0), (w, w)], fill=blue)
+    bar_h = int(w * 0.2)
+    # horizontal yellow bar
+    fdraw.rectangle([(0, int(w*0.4)), (w, int(w*0.4)+bar_h)], fill=yellow)
+    # vertical yellow bar (offset left of center)
+    fdraw.rectangle([(int(w*0.35), 0), (int(w*0.35)+bar_h, w)], fill=yellow)
     
     mask = Image.new('L', (radius*2, radius*2), 0)
     mdraw = ImageDraw.Draw(mask)
@@ -395,7 +400,7 @@ Write the NEXT {batch_size} turns. Speakers STRICTLY alternate starting with {cu
 
 {intro_instruction}Each turn: 3-4 SHORT sentences (6-10 words each) with PERIODS for natural TTS pauses. 20-30 seconds spoken.
 Simple present tense. A2 vocabulary. Natural Swedish. NO filler sounds.
-IMPORTANT: Highlight exactly 1 key A2 target vocabulary word in each turn's Swedish text using double asterisks, for example: "Wir schauen in die **Zukunft**."
+IMPORTANT: Highlight exactly 1 key A2 target vocabulary word in each turn's Swedish text using double asterisks, for example: "Vi tittar mot **framtiden**."
 
 Return EXACTLY {batch_size} turns as a JSON array (no markdown):
 [{{"speaker": "{current_host}", "swedish": "...", "english": "..."}},
@@ -406,7 +411,7 @@ Return EXACTLY {batch_size} turns as a JSON array (no markdown):
             resp = requests.post("https://gen.pollinations.ai/v1/chat/completions", json={
                 "model": AI_MODEL,
                 "messages": [
-                    {"role": "system", "content": "You write natural A2-level Swedish podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Astrid and Erik strictly alternate. Highlight 1 key target word per turn in double asterisks like **Wort**. No filler sounds."},
+                    {"role": "system", "content": "You write natural A2-level Swedish podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Astrid and Erik strictly alternate. Highlight 1 key target word per turn in double asterisks like **ord**. No filler sounds."},
                     {"role": "user", "content": prompt}
                 ],
                 "temperature": 0.9
