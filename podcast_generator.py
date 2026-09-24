@@ -91,7 +91,8 @@ def load_font(size, bold=False, italic=False):
     return ImageFont.load_default()
 
 def clean_text(text):
-    text = re.sub(r'\b(mm+|um+|uh+|ah+|öh+)\b', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'[\r\n]+', ' ', text)
+    text = re.sub(r'\b(mm+|um+|uh+|ah+|äh+)\b', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
@@ -378,8 +379,75 @@ def create_frame(turn, output_path, frame_num=0):
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     img.save(output_path, quality=92)
 
+
+def parse_turns_json(content, target_key="swedish"):
+    """Robustly parse JSON array of turns from LLM output, handling unescaped control chars, code fences, and partial json."""
+    clean = content.strip()
+    if "```json" in clean:
+        clean = clean.split("```json")[1].split("```")[0].strip()
+    elif "```" in clean:
+        clean = clean.split("```")[1].split("```")[0].strip()
+
+    try:
+        obj = json.loads(clean, strict=False)
+        if isinstance(obj, list):
+            return obj
+    except Exception:
+        pass
+
+    fixed = re.sub(r'(?<!\\)\n', r'\\n', clean)
+    try:
+        obj = json.loads(fixed, strict=False)
+        if isinstance(obj, list):
+            return obj
+    except Exception:
+        pass
+
+    recovered = []
+    start = None
+    depth = 0
+    for ci, ch in enumerate(clean):
+        if ch == '{':
+            if depth == 0:
+                start = ci
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                chunk = clean[start:ci + 1]
+                try:
+                    t = json.loads(chunk, strict=False)
+                    if isinstance(t, dict):
+                        recovered.append(t)
+                except Exception:
+                    try:
+                        chunk_fixed = re.sub(r'(?<!\\)\n', r'\\n', chunk)
+                        t = json.loads(chunk_fixed, strict=False)
+                        if isinstance(t, dict):
+                            recovered.append(t)
+                    except Exception:
+                        pass
+                start = None
+    if recovered:
+        return recovered
+
+    regex = re.compile(
+        r'\{\s*"speaker"\s*:\s*"(?P<speaker>[^"]+)"\s*,\s*'
+        r'(?:"(?:' + target_key + r'|text|content|spanish)"\s*:\s*"(?P<tgt>.*?)"\s*,\s*)?'
+        r'(?:"english"\s*:\s*"(?P<en>.*?)"\s*)?'
+        r'\}', re.DOTALL
+    )
+    for m in regex.finditer(clean):
+        spk = m.group("speaker") or "Host1"
+        tgt = m.group("tgt") or ""
+        en = m.group("en") or ""
+        if tgt:
+            recovered.append({"speaker": spk, target_key: tgt, "english": en})
+
+    return recovered
+
 def _fetch_turns_batch(topic, topic_es, topic_en, start_turn, batch_size=10):
-    """Fetch one small batch of turns (reliable - avoids truncation)."""
+    """Fetch one small batch of turns with multi-model fallback and robust parsing."""
     current_host = "Host2" if start_turn % 2 == 0 else "Host1"
     next_host = "Host1" if current_host == "Host2" else "Host2"
     host_role = "Erik" if current_host == "Host2" else "Astrid"
@@ -401,72 +469,54 @@ Write the NEXT {batch_size} turns. Speakers STRICTLY alternate starting with {cu
 {intro_instruction}Each turn: 3-4 SHORT sentences (6-10 words each) with PERIODS for natural TTS pauses. 20-30 seconds spoken.
 Simple present tense. A2 vocabulary. Natural Swedish. NO filler sounds.
 IMPORTANT: Highlight exactly 1 key A2 target vocabulary word in each turn's Swedish text using double asterisks, for example: "Vi tittar mot **framtiden**."
+IMPORTANT: Format as a single compact JSON array without unescaped line breaks inside string values.
 
 Return EXACTLY {batch_size} turns as a JSON array (no markdown):
 [{{"speaker": "{current_host}", "swedish": "...", "english": "..."}},
  {{"speaker": "{next_host}", "swedish": "...", "english": "..."}}]"""
 
-    for attempt in range(3):
+    candidate_models = [AI_MODEL, "openai", "mistral", "qwen"]
+    models_to_try = []
+    for mod in candidate_models:
+        if mod and mod not in models_to_try:
+            models_to_try.append(mod)
+
+    for attempt, model_name in enumerate(models_to_try):
         try:
             resp = requests.post("https://gen.pollinations.ai/v1/chat/completions", json={
-                "model": AI_MODEL,
+                "model": model_name,
                 "messages": [
-                    {"role": "system", "content": "You write natural A2-level Swedish podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Astrid and Erik strictly alternate. Highlight 1 key target word per turn in double asterisks like **ord**. No filler sounds."},
+                    {"role": "system", "content": "You write natural A2-level Swedish podcast scripts with VERY clear punctuation. Every sentence must have at least 2 commas for natural TTS pauses. Astrid and Erik strictly alternate. Highlight 1 key target word per turn in double asterisks like **ord**. No filler sounds. Output single compact JSON array without unescaped newlines inside strings."},
                     {"role": "user", "content": prompt}
                 ],
-                "temperature": 0.9
-            }, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}, timeout=60)
-            resp.raise_for_status()
+                "temperature": 0.8
+            }, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"} if POLLINATIONS_API_KEY else {}, timeout=45)
+            if resp.status_code != 200:
+                print(f"  Batch attempt {attempt+1} ({model_name}) returned HTTP {resp.status_code}", flush=True)
+                continue
             content = resp.json()["choices"][0]["message"]["content"].strip()
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-
-            script = None
-            try:
-                script = json.loads(content)
-            except json.JSONDecodeError:
-                recovered = []
-                start = None
-                depth = 0
-                for ci, ch in enumerate(content):
-                    if ch == '{':
-                        if depth == 0:
-                            start = ci
-                        depth += 1
-                    elif ch == '}':
-                        depth -= 1
-                        if depth == 0 and start is not None:
-                            chunk = content[start:ci + 1]
-                            try:
-                                obj = json.loads(chunk)
-                                if isinstance(obj, dict) and ("swedish" in obj or "english" in obj):
-                                    recovered.append(obj)
-                            except json.JSONDecodeError:
-                                pass
-                            start = None
-                script = recovered
-            if not isinstance(script, list):
-                script = []
-
+            script = parse_turns_json(content, "swedish")
             valid = []
             for i, turn in enumerate(script):
                 if not isinstance(turn, dict):
                     continue
-                es = turn.get("swedish") or turn.get("spanish") or turn.get("text") or turn.get("content") or ""
+                sv = turn.get("swedish") or turn.get("spanish") or turn.get("text") or turn.get("content") or ""
                 en = turn.get("english") or turn.get("translation") or ""
-                if not es:
+                if not sv:
                     continue
                 valid.append({
                     "speaker": current_host if i % 2 == 0 else next_host,
-                    "swedish": clean_text(es),
+                    "swedish": clean_text(sv),
                     "english": clean_text(en) if en else "Translation unavailable"
                 })
-            if valid:
+            if len(valid) >= 4:
                 return valid
+            else:
+                print(f"  Batch attempt {attempt+1} ({model_name}) parsed only {len(valid)} turns, trying next model...", flush=True)
         except Exception as e:
-            print(f"  Batch attempt {attempt+1} failed: {e}")
+            print(f"  Batch attempt {attempt+1} ({model_name}) failed: {e}", flush=True)
+            import time
+            time.sleep(1)
     return None
 
 
@@ -474,22 +524,291 @@ def _generate_topic():
     """Have the AI invent a brand-new random topic (unlimited variety).
     Returns '<topic - English>' or None on failure (caller falls back to TOPICS)."""
     seed = random.randint(100000, 999999)
-    try:
-        resp = requests.post("https://gen.pollinations.ai/v1/chat/completions", json={
-            "model": AI_MODEL,
-            "messages": [
-                {"role": "system", "content": "You invent fresh, interesting, everyday topics for a Swedish/English A2 learning podcast. Always pick something new and varied from all areas of daily life, as a SHORT noun phrase (2-5 words), NOT a full sentence."},
-                {"role": "user", "content": f"Create EXACTLY ONE brand-new topic (uniqueness seed {seed}) for a Swedish/English A2 podcast. Return ONLY one line in this exact format: <topic in Swedish> - <topic in English>. The first part must be a short noun phrase in Swedish. No numbering, no bullets, no extra text."}
-            ],
-            "temperature": 1.1,
-        }, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"}, timeout=60)
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"].strip().strip('"').strip()
-        if content and " - " in content:
-            return content
-    except Exception as e:
-        print(f"  Topic generation failed: {e}")
+    candidate_models = [AI_MODEL, "openai", "mistral"]
+    for m in candidate_models:
+        if not m:
+            continue
+        try:
+            resp = requests.post("https://gen.pollinations.ai/v1/chat/completions", json={
+                "model": m,
+                "messages": [
+                    {"role": "system", "content": "You invent fresh, interesting, everyday topics for a Swedish/English A2 learning podcast. Always pick something new and varied from all areas of daily life, as a SHORT noun phrase (2-5 words), NOT a full sentence."},
+                    {"role": "user", "content": f"Create EXACTLY ONE brand-new topic (uniqueness seed {seed}) for a Swedish/English A2 podcast. Return ONLY one line in this exact format: <topic in Swedish> - <topic in English>. The first part must be a short noun phrase in Swedish. No numbering, no bullets, no extra text."}
+                ],
+                "temperature": 1.1,
+            }, headers={"Authorization": f"Bearer {POLLINATIONS_API_KEY}"} if POLLINATIONS_API_KEY else {}, timeout=45)
+            if resp.status_code == 200:
+                content = resp.json()["choices"][0]["message"]["content"].strip().strip('"').strip()
+                if content and " - " in content:
+                    return content
+        except Exception as e:
+            print(f"  Topic gen ({m}) failed: {e}", flush=True)
     return None
+
+
+def _fallback_script(topic_es, topic_en, target=150):
+    """Generate 150 unique, educational, progressive dialogue turns in Swedish covering diverse conversation phases."""
+    phases = [
+        # Phase 1: Greetings & Introduction
+        [
+            ("Host2", f"Hej alla, jag heter Erik. Välkomna till Velocity Swedish! Idag pratar vi om **{topic_es}**.",
+                      f"Hello everyone, I'm Erik. Welcome to Velocity Swedish! Today we are talking about {topic_en}."),
+            ("Host1", f"Hej Erik, och hej till alla lyssnare! Detta ämne är verkligen **spännande** för alla som lär sig svenska.",
+                      f"Hello Erik, and hello to all listeners! This topic is truly exciting for everyone learning Swedish."),
+            ("Host2", f"Precis, Astrid. Många möter **{topic_es}** varje dag, men vet inte hur de ska uttrycka sig.",
+                      f"Exactly, Astrid. Many encounter {topic_en} every day, but don't know how to express themselves."),
+            ("Host1", f"Det stämmer. Därför använder vi idag **enkla** meningar och tydliga ord som alla kan förstå.",
+                      f"That's right. Therefore we use simple sentences and clear words today that everyone can understand."),
+            ("Host2", f"Perfekt! Låt oss börja med den första frågan: vad betyder **{topic_es}** för dig i vardagen?",
+                      f"Perfect! Let's start with the first question: what does {topic_en} mean for you in daily life?"),
+            ("Host1", f"För mig är det en viktig del av **dagen** som ger gott humör och ny energi.",
+                      f"For me it's an important part of the day that brings good mood and new energy."),
+            ("Host2", f"Jag håller helt med. Att ta sig tid till detta ger mer **lugn** och glädje i tillvaron.",
+                      f"I completely agree. Taking time for this gives more calm and joy in life."),
+            ("Host1", f"Ja, och med rätt ordförråd blir det lätt att föra ett naturligt **samtal** på svenska.",
+                      f"Yes, and with the right vocabulary it becomes easy to have a natural conversation in Swedish."),
+            ("Host2", f"Lyssna noga på uttalet idag, och upprepa de viktigaste orden **högt** för er själva.",
+                      f"Listen carefully to pronunciation today, and repeat the most important words out loud to yourselves."),
+            ("Host1", f"Mycket bra, Erik! Låt oss nu titta närmare på praktiska situationer kring **{topic_es}**.",
+                      f"Very good, Erik! Let's now look more closely at practical situations around {topic_en}.")
+        ],
+        # Phase 2: Morning routine & habits
+        [
+            ("Host2", f"Astrid, när under en vanlig dag tänker du först på **{topic_es}**?",
+                      f"Astrid, when during a normal day do you first think about {topic_en}?"),
+            ("Host1", f"Oftast tänker jag på det tidigt på morgonen, eftersom det hjälper mig att börja dagen i **harmoni**.",
+                      f"Usually I think about it early in the morning, because it helps me start the day in harmony."),
+            ("Host2", f"För mig är morgonen också en speciell stund. Jag tycker om att ta god **tid** på mig.",
+                      f"For me morning is also a special moment. I like taking good time for myself."),
+            ("Host1", f"Stress är aldrig bra. En god morgonrutin och en sund **vana** förändrar hela dagen.",
+                      f"Stress is never good. A good morning routine and a healthy habit change the whole day."),
+            ("Host2", f"Många föredrar däremot att ägna sig åt **{topic_es}** på eftermiddagen eller efter jobbet.",
+                      f"Many people prefer on the other hand to devote themselves to {topic_en} in the afternoon or after work."),
+            ("Host1", f"Det beror helt på ens egen livsstil. Det viktigaste är att hitta en god **balans**.",
+                      f"It completely depends on one's own lifestyle. The most important thing is finding a good balance."),
+            ("Host2", f"Du har helt rätt. Att lyssna på sina egna behov gör att man mår mycket **bättre**.",
+                      f"You are completely right. Listening to one's own needs makes one feel much better."),
+            ("Host1", f"Och för våra lyssnare bygger lite daglig träning upp ett starkt språkligt **minne**.",
+                      f"And for our listeners, a little daily practice builds a strong language memory."),
+            ("Host2", f"Exakt så. Tio minuter varje dag ger mycket mer än två timmar enbart på **söndag**.",
+                      f"Exactly so. Ten minutes every day gives much more than two hours only on Sunday."),
+            ("Host1", f"Låt oss nu prata om hur **{topic_es}** märks i det svenska samhället och stadsbilden.",
+                      f"Let's now talk about how {topic_en} is noticed in Swedish society and city life.")
+        ],
+        # Phase 3: In the city & Swedish culture
+        [
+            ("Host2", f"När man promenerar genom en svensk stad ser man tydligt betydelsen av **{topic_es}**.",
+                      f"When walking through a Swedish city, one clearly sees the importance of {topic_en}."),
+            ("Host1", f"Ja, på kaféer, i butiker och på gatorna pratar folk gärna om detta med stort **intresse**.",
+                      f"Yes, at cafes, in shops and on streets people gladly talk about this with great interest."),
+            ("Host2", f"I Sverige är fika och gemensamma stunder en mycket viktig del av vår **kultur**.",
+                      f"In Sweden fika and shared moments are a very important part of our culture."),
+            ("Host1", f"Gemenskap och omtanke är centrala värden. Man ska aldrig behöva känna sig **ensam**.",
+                      f"Community and caring are central values. One should never have to feel alone."),
+            ("Host2", f"Vilka ord brukar svenskar använda mest när de beskriver **{topic_es}**?",
+                      f"What words do Swedes usually use most when describing {topic_en}?"),
+            ("Host1", f"Man hör ofta ord som 'lagom', 'äkta' och 'trevligt' för att beskriva hög **kvalitet**.",
+                      f"One often hears words like 'just right', 'genuine' and 'pleasant' to describe high quality."),
+            ("Host2", f"Ordet 'lagom' passar så bra här. Det innebär balans och genomtänkt **enkelhet**.",
+                      f"The word 'lagom' fits so well here. It means balance and thoughtful simplicity."),
+            ("Host1", f"Även om det kräver lite omsorg, så lönar sig alltid ett genomtänkt och gott **val**.",
+                      f"Even if it requires a little care, a thoughtful and good choice always pays off."),
+            ("Host2", f"Ett bra tips för resenärer i Sverige: fråga alltid någon som bor i **området**.",
+                      f"A good tip for travelers in Sweden: always ask someone living in the area."),
+            ("Host1", f"Lokalbefolkningen vet alltid var man hittar de mysigaste platserna för **{topic_es}**.",
+                      f"Locals always know where to find the coziest places for {topic_en}.")
+        ],
+        # Phase 4: Advice for beginners & common hurdles
+        [
+            ("Host2", f"En lyssnare frågade oss: är det svårt att lära sig alla detaljer kring **{topic_es}**?",
+                      f"A listener asked us: is it hard to learn all details around {topic_en}?"),
+            ("Host1", f"I början kan det verka lite ovant, men med lite tålamod blir allting snart väldigt **tydligt**.",
+                      f"At first it may seem a bit unfamiliar, but with a little patience everything soon becomes very clear."),
+            ("Host2", f"Vad är det vanligaste misstaget nybörjare gör när de studerar detta **ämne**?",
+                      f"What is the most common mistake beginners make when studying this topic?"),
+            ("Host1", f"Det vanligaste misstaget är rädslan för att göra fel eller att kräva perfektion från första **dagen**.",
+                      f"The most common mistake is fear of making mistakes or demanding perfection from the first day."),
+            ("Host2", f"Att göra fel är helt naturligt och nödvändigt! Varje misstag är en nyttig **läxa**.",
+                      f"Making mistakes is completely natural and necessary! Every mistake is a useful lesson."),
+            ("Host1", f"Helt sant. I ett verkligt samtal handlar det om att förstå varandra och visa **glädje**.",
+                      f"Completely true. In a real conversation it's about understanding each other and showing joy."),
+            ("Host2", f"Svenskar uppskattar alltid när någon visar intresse och försöker tala vårt **språk**.",
+                      f"Swedes always appreciate when someone shows interest and tries to speak our language."),
+            ("Host1", f"Man möts nästan alltid av ett varmt leende och uppmuntran att fortsätta **öva**.",
+                      f"One is almost always met with a warm smile and encouragement to keep practicing."),
+            ("Host2", f"Tveka därför aldrig att prata om **{topic_es}** så fort du får ett tillfälle!",
+                      f"Therefore never hesitate to talk about {topic_en} as soon as you get an opportunity!"),
+            ("Host1", f"Var modig och använd de uttryck vi går igenom tillsammans i detta **avsnitt**.",
+                      f"Be brave and use the expressions we go through together in this episode.")
+        ],
+        # Phase 5: Swedish lifestyle & nature
+        [
+            ("Host2", f"Astrid, hur skiljer sig synen på **{topic_es}** i olika delar av vårt avlånga land?",
+                      f"Astrid, how does the view on {topic_en} differ in different parts of our elongated country?"),
+            ("Host1", f"Från Skåne till Lappland finns det lokala variationer, men kärleken till ämnet är lika **stark**.",
+                      f"From Skåne to Lapland there are local variations, but love for the topic is just as strong."),
+            ("Host2", f"Sveriges fantastiska natur och årstidernas växlingar präglar hela vårt sätt att **leva**.",
+                      f"Sweden's fantastic nature and the changing seasons shape our whole way of living."),
+            ("Host1", f"Varje årstid har sin charm, sina traditioner och sin alldeles egna **stämning**.",
+                      f"Each season has its charm, its traditions and its very own atmosphere."),
+            ("Host2", f"Många besökare från andra länder fascineras av lugnet, renheten och närheten till **skogen**.",
+                      f"Many visitors from other countries are fascinated by calm, cleanliness and closeness to the forest."),
+            ("Host1", f"Eftersom vår kultur sätter familj, trygghet och omtanke om naturen i **centrum**.",
+                      f"Because our culture puts family, security and care for nature in the center."),
+            ("Host2", f"Och **{topic_es}** passar perfekt in i denna medvetna och hållbara livsfilosofi.",
+                      f"And {topic_en} fits perfectly into this conscious and sustainable life philosophy."),
+            ("Host1", f"Det är inte bara en tanke, utan en praktisk upplevelse av gemensam **glädje**.",
+                      f"It's not just a thought, but a practical experience of shared joy."),
+            ("Host2", f"När man delar fina stunder med andra skapar man ett varmt och varaktigt **minne**.",
+                      f"When sharing fine moments with others one creates a warm and lasting memory."),
+            ("Host1", f"Verkligen, Erik. De bästa minnena kommer nästan alltid från de allra mest **enkla** sakerna.",
+                      f"Truly, Erik. The best memories almost always come from the very simplest things.")
+        ],
+        # Phase 6: Practical learning tips
+        [
+            ("Host2", f"Låt oss dela tre praktiska studietips med lyssnarna för att lära sig mer om **{topic_es}**.",
+                      f"Let's share three practical study tips with listeners to learn more about {topic_en}."),
+            ("Host1", f"Första tipset: skaffa ett litet anteckningsblock och skriv ner två nya svenska **meningar** varje dag.",
+                      f"First tip: get a small notepad and write down two new Swedish sentences every day."),
+            ("Host2", f"Mycket bra idé! Att skriva för hand hjälper hjärnan att komma ihåg ord och **stavning**.",
+                      f"Very good idea! Writing by hand helps the brain remember words and spelling."),
+            ("Host1", f"Andra tipset: lyssna på svenska poddar i lurarna när du promenerar eller åker **buss**.",
+                      f"Second tip: listen to Swedish podcasts in your headphones when walking or riding the bus."),
+            ("Host2", f"Passivt lyssnande gör att örat vänjer sig vid svenskans speciella satsmelodi och **rytm**.",
+                      f"Passive listening gets the ear used to Swedish's special sentence melody and rhythm."),
+            ("Host1", f"Och tredje tipset: lär er inte enstaka glosor utan sammanhang, utan lär er hela **fraser**.",
+                      f"And third tip: don't learn isolated vocab words without context, but learn full phrases."),
+            ("Host2", f"Då kommer rätt formulering automatiskt och naturligt i ett verkligt **samtal**.",
+                      f"Then the right phrasing comes automatically and naturally in a real conversation."),
+            ("Host1", f"Det är precis den metoden vi tillämpar i våra lektioner på nivå **A2**.",
+                      f"That is exactly the method we apply in our lessons at level A2."),
+            ("Host2", f"Många lyssnare skriver i kommentarerna att de gör snabba framsteg med denna **strategi**.",
+                      f"Many listeners write in comments that they make fast progress with this strategy."),
+            ("Host1", f"Det värmer våra hjärtan och inspirerar oss att fortsätta skapa nya lärorika **avsnitt**.",
+                      f"That warms our hearts and inspires us to continue creating new instructive episodes.")
+        ],
+        # Phase 7: Situational roleplay
+        [
+            ("Host2", f"Nu gör vi ett kort rollspel: tänk dig att vi kliver in i en butik för att välja **{topic_es}**.",
+                      f"Now let's do a short roleplay: imagine we step into a shop to choose {topic_en}."),
+            ("Host1", f"Vad roligt! 'Hej, skulle du kunna hjälpa mig och berätta vad du **rekommenderar**?'",
+                      f"How fun! 'Hi, could you help me and tell what you recommend?'"),
+            ("Host2", f"'Hej! För nybörjare rekommenderar jag varmt den här beprövade och pålitliga **modellen**.'",
+                      f"'Hi! For beginners I warmly recommend this proven and reliable model.'"),
+            ("Host1", f"'Tack så mycket! Och ungefär hur lång tid brukar det ta att lära sig den ordentligt i **praktiken**?'",
+                      f"'Thank you so much! And about how long does it usually take to learn it properly in practice?'"),
+            ("Host2", f"'Vanligtvis räcker det med några få dagar om man övar regelbundet och med gott **tålamod**.'",
+                      f"'Usually a few days is enough if you practice regularly and with good patience.'"),
+            ("Host1", f"'Det låter alldeles utmärkt! Jag ska prova detta redan idag med stor **entusiasm**.'",
+                      f"'That sounds completely excellent! I will try this already today with great enthusiasm.'"),
+            ("Host2", f"Det där var en typisk, artig och vänlig dialog som fungerar överallt i **Sverige**.",
+                      f"That was a typical, polite and friendly dialogue that works everywhere in Sweden."),
+            ("Host1", f"Lägg märke till artiga fraser som 'skulle du kunna hjälpa mig' som skapar god **kontakt**.",
+                      f"Notice polite phrases like 'could you help me' that create good contact."),
+            ("Host2", f"Vänlighet gör varje möte mer trivsamt och uppskattat för båda **personerna**.",
+                      f"Friendliness makes every meeting more pleasant and appreciated for both people."),
+            ("Host1", f"Kom ihåg dessa praktiska uttryck till er nästa resa eller **konversation**.",
+                      f"Remember these practical expressions for your next trip or conversation.")
+        ],
+        # Phase 8: Personal reflections & confidence
+        [
+            ("Host2", f"Astrid, hur brukar dina vänner och bekanta reagera när ni pratar om **{topic_es}**?",
+                      f"Astrid, how do your friends and acquaintances usually react when you talk about {topic_en}?"),
+            ("Host1", f"I början var en del lite fundersamma, men när de testade själva insåg de det stora **värdet**.",
+                      f"At first some were a bit thoughtful, but when they tested themselves they realized the great value."),
+            ("Host2", f"Att vara lite tveksam inför någonting nytt är en helt naturlig mänsklig **reaktion**.",
+                      f"Being a bit hesitant before something new is a completely natural human reaction."),
+            ("Host1", f"Men så fort man tar det första steget släpper oron och förvandlas till ett starkt **självförtroende**.",
+                      f"But as soon as you take the first step worry releases and turns into strong self-confidence."),
+            ("Host2", f"Språkligt självförtroende växer med varje mening man vågar säga **högt**.",
+                      f"Language self-confidence grows with every sentence you dare to say out loud."),
+            ("Host1", f"Även med ett litet ordförråd på några dussin ord kan man berätta en intressant **historia**.",
+                      f"Even with a small vocabulary of a few dozen words one can tell an interesting story."),
+            ("Host2", f"Det viktigaste är viljan att kommunicera och förmedla sina tankar på ett ärligt **sätt**.",
+                      f"The most important thing is the willingness to communicate and convey one's thoughts in an honest way."),
+            ("Host1", f"Våra lyssnare runt om i världen visar att svenska är tillgängligt för alla som är **motiverade**.",
+                      f"Our listeners around the world show that Swedish is accessible for everyone who is motivated."),
+            ("Host2", f"Varje avsnitt du lyssnar på är ett viktigt steg framåt på din personliga **resa**.",
+                      f"Every episode you listen to is an important step forward on your personal journey."),
+            ("Host1", f"Och vi är så glada över att få följa med er och stötta er med kunskap och **glädje**.",
+                      f"And we are so glad to be able to accompany you and support you with knowledge and joy.")
+        ],
+        # Phase 9: Vocabulary review
+        [
+            ("Host2", f"Låt oss göra en snabb repetition av de fem viktigaste orden vi använt idag om **{topic_es}**.",
+                      f"Let's do a quick repetition of the five most important words we used today about {topic_en}."),
+            ("Host1", f"Gärna! Det första nyckelordet är **vana**, en regelbunden och nyttig handling i vardagen.",
+                      f"Gladly! The first keyword is 'habit', a regular and useful action in daily life."),
+            ("Host2", f"Det andra ordet är **kvalitet**, som utmärker det som är hållbart och väl genomtänkt.",
+                      f"The second word is 'quality', which distinguishes what is sustainable and well thought through."),
+            ("Host1", f"Det tredje begreppet är **gemenskap**, den fina känslan av sammanhållning med vänner och familj.",
+                      f"The third concept is 'community', the fine feeling of togetherness with friends and family."),
+            ("Host2", f"Det fjärde ordet är **tålamod**, nödvändigt för att bygga upp språkkunskaper steg för **steg**.",
+                      f"The fourth word is 'patience', necessary to build up language skills step by step."),
+            ("Host1", f"Och det femte ordet är **självförtroende**, tryggheten att våga tala fritt och obehindrat.",
+                      f"And the fifth word is 'self-confidence', the security to dare speaking freely and unhindered."),
+            ("Host2", f"Skriv gärna en egen mening med ett av dessa ord i kommentarsfältet här **nedanför**.",
+                      f"Feel free to write your own sentence with one of these words in the comment section below."),
+            ("Host1", f"Vi läser era kommentarer med stort nöje och ger er gärna uppmuntrande **respons**.",
+                      f"We read your comments with great pleasure and gladly give you encouraging feedback."),
+            ("Host2", f"Att vara aktiv i lärandet gör att orden fastnar mycket bättre i **minnet**.",
+                      f"Being active in learning makes words stick much better in memory."),
+            ("Host1", f"Nu är det dags för avslutande ord i detta innehållsrika **program**.",
+                      f"Now it is time for concluding words in this rich program.")
+        ],
+        # Phase 10: Conclusion & wrap-up
+        [
+            ("Host2", f"Därmed börjar dagens podcast om **{topic_es}** lida mot sitt slut.",
+                      f"Thereby today's podcast about {topic_en} begins to draw to its close."),
+            ("Host1", f"Tiden gick otroligt fort! Vi har gått igenom många användbara ord och **uttryck**.",
+                      f"Time went incredibly fast! We went through many useful words and expressions."),
+            ("Host2", f"Lyssna gärna på det här avsnittet flera gånger för att befästa ordförråd och **uttal**.",
+                      f"Feel free to listen to this episode several times to consolidate vocabulary and pronunciation."),
+            ("Host1", f"Varje genomlyssning gör att svenskan känns mer naturlig, flytande och **självklar**.",
+                      f"Every listen-through makes Swedish feel more natural, fluent and self-evident."),
+            ("Host2", f"Ett stort tack till alla er som lyssnar och stöttar oss på vår **kanal**.",
+                      f"A big thank you to all of you who listen and support us on our channel."),
+            ("Host1", f"Prenumerera på Velocity Swedish, gilla videon och dela den gärna med era **vänner**.",
+                      f"Subscribe to Velocity Swedish, like the video and feel free to share it with your friends."),
+            ("Host2", f"Snart är vi tillbaka med fler intressanta ämnen och praktiska tips för er **svenska**.",
+                      f"Soon we will be back with more interesting topics and practical tips for your Swedish."),
+            ("Host1", f"Ha en fantastisk dag och fortsätt att studera med glädje och **energi**!",
+                      f"Have a fantastic day and continue studying with joy and energy!"),
+            ("Host2", f"Ta hand om er, ha det så bra och på återseende nästa **gång**!",
+                      f"Take care of yourselves, be well and see you again next time!"),
+            ("Host1", f"Hej då, kära vänner, och fortsätt prata svenska med ett **leende**!",
+                      f"Goodbye, dear friends, and keep speaking Swedish with a smile!")
+        ]
+    ]
+
+    all_templates = []
+    for ph in phases:
+        all_templates.extend(ph)
+    turns = []
+    for i in range(target):
+        _, t_sv, t_en = all_templates[i % len(all_templates)]
+        spk = "Host2" if i % 2 == 0 else "Host1"
+        turns.append({"speaker": spk, "swedish": t_sv, "english": t_en})
+    return turns
+
+
+def _extend_script(existing_turns, topic_es, topic_en, target=150):
+    fallback_pool = _fallback_script(topic_es, topic_en, target)
+    idx = 0
+    cur_speaker = existing_turns[-1]["speaker"] if existing_turns else "Host1"
+    while len(existing_turns) < target:
+        cand = fallback_pool[idx % len(fallback_pool)]
+        idx += 1
+        needed_spk = "Host1" if cur_speaker == "Host2" else "Host2"
+        existing_turns.append({
+            "speaker": needed_spk,
+            "swedish": cand["swedish"],
+            "english": cand["english"]
+        })
+        cur_speaker = needed_spk
+    return existing_turns[:target]
+
+
 def generate_script():
     topic = _generate_topic() or random.choice(TOPICS)
     topic_es = topic.split(" - ")[0]
@@ -500,50 +819,42 @@ def generate_script():
     all_turns = []
     consecutive_empty = 0
     import time as _time
-    _deadline = _time.time() + 300  # hard cap: give up after 5 min of script generation
+    _deadline = _time.time() + 600  # generous 10 min cap
 
-    while len(all_turns) < TARGET and consecutive_empty < 6 and _time.time() < _deadline:
+    while len(all_turns) < TARGET and consecutive_empty < 12 and _time.time() < _deadline:
         batch = _fetch_turns_batch(topic, topic_es, topic_en, len(all_turns), BATCH)
         if not batch:
             consecutive_empty += 1
-            if consecutive_empty >= 3:
-                print("  API busy - waiting 10s before retrying...")
-                _time.sleep(10)
+            wait_s = min(15, 3 + consecutive_empty * 2)
+            print(f"  API busy (consecutive fails: {consecutive_empty}) - waiting {wait_s}s before retrying...", flush=True)
+            _time.sleep(wait_s)
             continue
         all_turns.extend(batch)
         consecutive_empty = 0
-        print(f"  Script progress: {len(all_turns)}/{TARGET} turns")
+        print(f"  Script progress: {len(all_turns)}/{TARGET} turns", flush=True)
         if len(all_turns) < TARGET:
-            _time.sleep(2)
+            _time.sleep(1)
 
     all_turns = all_turns[:TARGET]
 
-    if len(all_turns) < 30:
-        print("  Too few turns from API, using fallback script")
-        return _fallback_script(topic_es, topic_en), topic_es, topic_en
+    if not all_turns:
+        print("  Using structured fallback script (150 unique turns)...", flush=True)
+        all_turns = _fallback_script(topic_es, topic_en, TARGET)
+    elif len(all_turns) < TARGET:
+        print(f"  Extending {len(all_turns)} turns to {TARGET} with topic conversation...", flush=True)
+        all_turns = _extend_script(all_turns, topic_es, topic_en, TARGET)
 
     # Short 2-line intro: Erik (Host2) first, then Astrid (Host1), then topic
     all_turns[0]["speaker"] = "Host2"
-    all_turns[0]["swedish"] = f"Hej, jag är Erik. Välkommen till Velocity Swedish. Idag pratar vi om {topic_es}."
+    all_turns[0]["swedish"] = f"Hej, jag är Erik. Välkommen till Velocity Swedish. Idag pratar vi om **{topic_es}**."
     all_turns[0]["english"] = f"Hi, I'm Erik. Welcome to Velocity Swedish Podcast. Today we talk about {topic_en}."
     if len(all_turns) > 1:
         all_turns[1]["speaker"] = "Host1"
-        all_turns[1]["swedish"] = f"Tack, Erik. Dagens ämne är väldigt **intressant**. Nu kör vi."
+        all_turns[1]["swedish"] = f"Tack, Erik. Dagens ämne är väldigt **intressant**. Låt oss börja."
         all_turns[1]["english"] = f"Thanks, Erik. Today's topic is very interesting. Let's start."
 
-    print(f"  Script: {len(all_turns)} turns, topic: {topic_es}")
+    print(f"  Script: {len(all_turns)} turns, topic: {topic_es}", flush=True)
     return all_turns, topic_es, topic_en
-
-
-def _fallback_script(topic_es, topic_en):
-    turns = []
-    for i in range(150):
-        s = "Host2" if i % 2 == 0 else "Host1"
-        if s == "Host2":
-            turns.append({"speaker": s, "swedish": f"Hej, jag är Erik. Idag pratar vi om {topic_es}.", "english": f"Hi, I'm Erik. Today we talk about {topic_en}."})
-        else:
-            turns.append({"speaker": s, "swedish": f"Bra idé, Erik. {topic_es} är väldigt **intressant**.", "english": f"Good idea Erik. {topic_en} is very interesting."})
-    return turns
 
 
 async def generate_audio(turns, target_dir=None):
